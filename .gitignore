@@ -1,0 +1,16 @@
+# Dependências
+node_modules/
+
+# Autenticação do WhatsApp
+auth/
+
+# Variáveis de ambiente
+.env
+
+# Logs
+*.log
+npm-debug.log*
+
+# Sistema
+.DS_Store
+Thumbs.db
