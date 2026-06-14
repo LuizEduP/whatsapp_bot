@@ -3,8 +3,9 @@
 // =============================================================================
 // Lógica principal de conexão WhatsApp, comandos e integração com DeepSeek
 // =============================================================================
+// NOTA: O Baileys é importado dinamicamente com import() pois é ESM.
+// =============================================================================
 
-const { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const pino = require('pino');
 const qrcode = require('qrcode-terminal');
@@ -13,7 +14,7 @@ const fs = require('fs');
 const path = require('path');
 
 // -----------------------------------------------------------------------------
-// CONFIGURAÇÃO
+// CONFIGURAÇÃO (via variáveis de ambiente)
 // -----------------------------------------------------------------------------
 
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
@@ -22,25 +23,25 @@ const MAX_HISTORY = parseInt(process.env.MAX_HISTORY) || 20;
 const AUTH_DIR = path.join(__dirname, 'auth');
 
 // -----------------------------------------------------------------------------
-// VALIDAÇÃO
+// VALIDAÇÃO DA CONFIGURAÇÃO
 // -----------------------------------------------------------------------------
 
 function validateConfig() {
     if (!DEEPSEEK_API_KEY || DEEPSEEK_API_KEY === 'sua_chave_aqui') {
         console.error('❌ ERRO: DEEPSEEK_API_KEY não configurada');
-        console.error('📝 Defina a variável de ambiente DEEPSEEK_API_KEY no Railway');
+        console.error('📝 Defina a variável de ambiente DEEPSEEK_API_KEY');
         return false;
     }
     return true;
 }
 
 // -----------------------------------------------------------------------------
-// ESTADO DA APLICAÇÃO
+// ESTADO DA APLICAÇÃO (em memória)
 // -----------------------------------------------------------------------------
 
 const state = {
-    activeChats: new Set(),
-    chatHistory: new Map(),
+    activeChats: new Set(),   // Chats com modo IA ativo
+    chatHistory: new Map(),   // Histórico de conversas por chat
 };
 
 // -----------------------------------------------------------------------------
@@ -65,7 +66,7 @@ async function sendTypingIndicator(sock, jid) {
     try {
         await sock.sendPresenceUpdate('composing', jid);
     } catch (error) {
-        // Ignora erros de indicador de digitação (não crítico)
+        // Indicador de digitação não é crítico, ignora erros
     }
 }
 
@@ -81,7 +82,7 @@ function getPhoneNumber(jid) {
 }
 
 // -----------------------------------------------------------------------------
-// GERENCIAMENTO DO HISTÓRICO
+// GERENCIAMENTO DO HISTÓRICO (com limite de tokens)
 // -----------------------------------------------------------------------------
 
 function getChatHistory(chatId) {
@@ -94,9 +95,9 @@ function addToHistory(chatId, role, content) {
     }
     const history = state.chatHistory.get(chatId);
     history.push({ role, content });
+    // Remove as mensagens mais antigas se exceder o limite
     if (history.length > MAX_HISTORY) {
-        const excess = history.length - MAX_HISTORY;
-        history.splice(0, excess);
+        history.splice(0, history.length - MAX_HISTORY);
     }
 }
 
@@ -105,7 +106,7 @@ function clearChatHistory(chatId) {
 }
 
 // -----------------------------------------------------------------------------
-// INTEGRAÇÃO COM A API DEEPSEEK
+// INTEGRAÇÃO COM A API DEEPSEEK (sem dependências externas)
 // -----------------------------------------------------------------------------
 
 function callDeepSeekAPI(messages) {
@@ -115,7 +116,6 @@ function callDeepSeekAPI(messages) {
             messages,
             temperature: 0.7,
             max_tokens: 2048,
-            stream: false,
         });
 
         const options = {
@@ -162,7 +162,10 @@ function callDeepSeekAPI(messages) {
 async function getAIResponse(chatId, userMessage) {
     const history = getChatHistory(chatId);
     const messages = [
-        { role: 'system', content: 'Você é um assistente amigável e prestativo. Responda em português brasileiro. Seja educado, objetivo e mantenha conversas naturais.' },
+        {
+            role: 'system',
+            content: 'Você é um assistente amigável e prestativo. Responda em português brasileiro. Seja educado, objetivo e mantenha conversas naturais.',
+        },
         ...history,
         { role: 'user', content: userMessage },
     ];
@@ -173,7 +176,7 @@ async function getAIResponse(chatId, userMessage) {
 }
 
 // -----------------------------------------------------------------------------
-// COMANDOS
+// COMANDOS DO BOT
 // -----------------------------------------------------------------------------
 
 async function handleCommands(sock, chatId, text, senderNumber) {
@@ -227,17 +230,59 @@ async function handleCommands(sock, chatId, text, senderNumber) {
 }
 
 // -----------------------------------------------------------------------------
-// INICIALIZAÇÃO DO WHATSAPP
+// TRATAMENTO DE ERROS DE SESSÃO (Bad MAC, etc.)
+// -----------------------------------------------------------------------------
+
+let badMACCount = 0;
+const BAD_MAC_LIMIT = 3;
+
+function handleSessionError(error) {
+    if (!error) return;
+    const errorStr = String(error.message || error);
+    if (errorStr.includes('Bad MAC')) {
+        badMACCount++;
+        console.warn(`⚠️ [${getTimestamp()}] Erro Bad MAC (${badMACCount}/${BAD_MAC_LIMIT})`);
+        if (badMACCount >= BAD_MAC_LIMIT) {
+            console.warn('🧹 Limpando sessão corrompida...');
+            try {
+                if (fs.existsSync(AUTH_DIR)) {
+                    const files = fs.readdirSync(AUTH_DIR);
+                    files.forEach((file) => {
+                        if (file !== 'creds.json') {
+                            try { fs.unlinkSync(path.join(AUTH_DIR, file)); } catch (e) {}
+                        }
+                    });
+                }
+                console.log('✅ Sessão limpa. Reconectando...');
+                badMACCount = 0;
+            } catch (e) {
+                console.error('❌ Erro ao limpar sessão:', e.message);
+            }
+        }
+    }
+}
+
+process.on('uncaughtException', (err) => handleSessionError(err));
+process.on('unhandledRejection', (reason) => {
+    if (reason) handleSessionError(reason instanceof Error ? reason : new Error(String(reason)));
+});
+
+// -----------------------------------------------------------------------------
+// INICIALIZAÇÃO DO WHATSAPP (com import dinâmico do Baileys)
 // -----------------------------------------------------------------------------
 
 /**
  * Inicia o bot WhatsApp.
- * @param {object} callbacks - Objeto com funções de callback para o servidor web
- *   { onQR, onConnected, onDisconnected, onAuthState }
- * @returns {Promise<object>} O socket do WhatsApp
+ * @param {object} callbacks - { onQR, onConnected, onDisconnected, onAuthState }
+ * @returns {Promise<object>} Socket do WhatsApp
  */
 async function startWhatsAppBot(callbacks = {}) {
     const { onQR, onConnected, onDisconnected, onAuthState } = callbacks;
+
+    // Importa o Baileys dinamicamente (ESM module)
+    const baileys = await import('@whiskeysockets/baileys');
+    const makeWASocket = baileys.default;
+    const { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = baileys;
 
     console.log('╔══════════════════════════════════════════════╗');
     console.log('║     🤖 WhatsApp AI Bot - DeepSeek            ║');
@@ -269,86 +314,32 @@ async function startWhatsAppBot(callbacks = {}) {
 
     sock.ev.on('creds.update', saveCreds);
 
-    // =========================================================================
-    // TRATAMENTO DE ERROS DE SESSÃO (Bad MAC, etc.)
-    // =========================================================================
-    // O erro "Bad MAC" ocorre quando a sessão do WhatsApp é corrompida.
-    // Neste caso, limpamos a autenticação e reconectamos do zero.
-    // =========================================================================
-
-    sock.ev.on('messages.upsert', (messageUpsert) => {
-        // Handler separado apenas para capturar erros de sessão
-    });
-
-    // Captura erros de sessão (como Bad MAC) emitidos pelo socket
-    const originalEnd = sock.end;
-    let badMACCount = 0;
-    const BAD_MAC_LIMIT = 3; // Limite de erros Bad MAC antes de limpar sessão
-
+    // Reseta contador de Bad MAC em novo login
     sock.ev.on('connection.update', (update) => {
         if (update.isNewLogin) {
-            badMACCount = 0; // Reseta contador em novo login
+            badMACCount = 0;
         }
     });
 
-    // Trata o erro Bad MAC automaticamente
-    function handleSessionError(error) {
-        if (!error) return;
-        const errorStr = String(error.message || error);
-        if (errorStr.includes('Bad MAC')) {
-            badMACCount++;
-            console.warn(`⚠️ [${getTimestamp()}] Erro Bad MAC detectado (${badMACCount}/${BAD_MAC_LIMIT})`);
-
-            if (badMACCount >= BAD_MAC_LIMIT) {
-                console.warn('🧹 Limpando sessão corrompida devido a múltiplos erros Bad MAC...');
-                try {
-                    // Remove todos os arquivos da sessão (exceto creds.json para preservar número)
-                    if (fs.existsSync(AUTH_DIR)) {
-                        const files = fs.readdirSync(AUTH_DIR);
-                        files.forEach(file => {
-                            if (file !== 'creds.json') {
-                                const filePath = path.join(AUTH_DIR, file);
-                                try {
-                                    fs.unlinkSync(filePath);
-                                } catch (e) {
-                                    // Ignora erros ao deletar
-                                }
-                            }
-                        });
-                    }
-                    console.log('✅ Sessão limpa. Reconectando...');
-                    badMACCount = 0;
-                } catch (e) {
-                    console.error('❌ Erro ao limpar sessão:', e.message);
-                }
-            }
-        }
-    }
-
-    // Escuta erros não tratados no socket
-    process.on('uncaughtException', (err) => {
-        handleSessionError(err);
-    });
-    process.on('unhandledRejection', (reason) => {
-        if (reason) {
-            handleSessionError(reason instanceof Error ? reason : new Error(String(reason)));
-        }
-    });
-
+    // Gerenciamento de conexão e QR Code
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
-            console.log('\n📱 Escaneie o QR Code abaixo para conectar ao WhatsApp:');
+            console.log('\n📱 Escaneie o QR Code abaixo:');
             qrcode.generate(qr, { small: true });
-            console.log('\n⏳ Aguardando leitura do QR Code...');
+            console.log('\n⏳ Aguardando leitura...');
             if (onQR) onQR(qr);
         }
 
         if (connection === 'close') {
             const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
-            const reasonName = Object.keys(DisconnectReason).find(k => DisconnectReason[k] === reason) || reason;
-            console.log(`🔌 [${getTimestamp()}] Conexão fechada. Motivo: ${reason} (${reasonName})`);
+            const reasonName = Object.keys(DisconnectReason).find(
+                (k) => DisconnectReason[k] === reason
+            ) || reason;
+            console.log(
+                `🔌 [${getTimestamp()}] Conexão fechada. Motivo: ${reason} (${reasonName})`
+            );
 
             if (onDisconnected) onDisconnected(reasonName);
 
@@ -370,6 +361,7 @@ async function startWhatsAppBot(callbacks = {}) {
         }
     });
 
+    // Processamento de mensagens recebidas
     sock.ev.on('messages.upsert', async (messageUpsert) => {
         try {
             if (messageUpsert.type !== 'notify') return;
@@ -379,28 +371,50 @@ async function startWhatsAppBot(callbacks = {}) {
                 if (msg.key.remoteJid === 'status@broadcast') continue;
 
                 const chatId = msg.key.remoteJid;
-                const messageText = msg.message?.conversation ||
-                                    msg.message?.extendedTextMessage?.text ||
-                                    '';
-                const senderNumber = getPhoneNumber(msg.key.participant || msg.key.remoteJid);
+                const messageText =
+                    msg.message?.conversation ||
+                    msg.message?.extendedTextMessage?.text ||
+                    '';
+                const senderNumber = getPhoneNumber(
+                    msg.key.participant || msg.key.remoteJid
+                );
 
                 if (!messageText.trim()) continue;
 
-                const isCommand = await handleCommands(sock, chatId, messageText, senderNumber);
+                // Tenta processar comando
+                const isCommand = await handleCommands(
+                    sock,
+                    chatId,
+                    messageText,
+                    senderNumber
+                );
                 if (isCommand) continue;
 
+                // Se IA não estiver ativa, ignora
                 if (!state.activeChats.has(chatId)) continue;
 
-                console.log(`💬 [${getTimestamp()}] ${senderNumber}: ${messageText.substring(0, 100)}${messageText.length > 100 ? '...' : ''}`);
+                console.log(
+                    `💬 [${getTimestamp()}] ${senderNumber}: ${messageText.substring(0, 100)}${messageText.length > 100 ? '...' : ''}`
+                );
+
                 await sendTypingIndicator(sock, chatId);
 
                 try {
                     const aiResponse = await getAIResponse(chatId, messageText);
                     await sendMessage(sock, chatId, aiResponse);
-                    console.log(`🤖 [${getTimestamp()}] Resposta enviada para ${senderNumber}`);
+                    console.log(
+                        `🤖 [${getTimestamp()}] Resposta enviada para ${senderNumber}`
+                    );
                 } catch (error) {
-                    console.error(`❌ [${getTimestamp()}] Erro IA ${senderNumber}:`, error.message);
-                    await sendMessage(sock, chatId, `❌ Erro ao processar: ${error.message}`);
+                    console.error(
+                        `❌ [${getTimestamp()}] Erro IA ${senderNumber}:`,
+                        error.message
+                    );
+                    await sendMessage(
+                        sock,
+                        chatId,
+                        `❌ Erro ao processar: ${error.message}`
+                    );
                 }
             }
         } catch (error) {
